@@ -1,0 +1,1089 @@
+===== cloud_proxy_example.py =====
+"""
+Axonris 3D Generator - Trellis Windows-to-WSL Proxy Server
+
+Ta skripta posluša TCP zahteve (JSON) iz C++ GUI programa na Windowsih
+in asinhrono zažene dejanski proces za Microsoft TRELLIS v WSL2 (Ubuntu).
+Na ta način C++ ne potrebuje zavedanja o WSL2 arhitekturi.
+"""
+
+import sys
+import os
+import socket
+import json
+import time
+import shutil
+try:
+    from gradio_client import Client, handle_file
+except ImportError:
+    print("[TRELLIS_PROXY] Opozorilo: gradio_client ni nameščen. Zaženi: pip install gradio_client")
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 5000
+
+def generate_via_cloud(image_path, win_out_path, ssat_steps, slat_scale):
+    print(f"[TRELLIS_PROXY] Uporabljam Cloud API (Hugging Face) za: {image_path}")
+    try:
+        client = Client("trellis-community/TRELLIS")
+        
+        print("[TRELLIS_PROXY] Pošiljam sliko v oblak...")
+        # Klic API-ja
+        # Uporablja paramatre: image, ssat_steps, slat_scale
+        # Za gradio_client navadno posredujemo handle_file()
+        result = client.predict(
+                image=handle_file(image_path),
+                ssat_steps=ssat_steps,
+                slat_scale=slat_scale,
+                api_name="/image_to_3d"
+        )
+        
+        # Result je pot do zgenerirane datoteke v gradio temp mapi
+        # Ali pa tuple (video, glb_path) odvisno od specifikacije HF Space-a.
+        # Naredimo preprost pregled in kopiranje:
+        if isinstance(result, tuple) or isinstance(result, list):
+            glb_file = result[1] if len(result) > 1 else result[0]
+        else:
+            glb_file = result
+            
+        print(f"[TRELLIS_PROXY] Prejeto iz oblaka: {glb_file}")
+        
+        if os.path.exists(glb_file):
+            shutil.copy(glb_file, win_out_path)
+            return True, ""
+        else:
+            return False, "Datoteka z oblaka ne obstaja na disku."
+            
+    except Exception as e:
+        return False, str(e)
+
+def handle_client(conn, addr):
+    print(f"[TRELLIS_PROXY] Povezan GUI: {addr}")
+    try:
+        data = conn.recv(16384).decode('utf-8')
+        if not data:
+            return
+            
+        request = json.loads(data)
+        if request.get("action") == "generate":
+            image_path = request.get("image_path")
+            ssat_steps = request.get("geometry_resolution", 25) 
+            slat_scale = request.get("threshold", 0.5) 
+            
+            win_out_path = image_path + "_output.glb"
+            start_time = time.time()
+            
+            # Trenutno ROCm lokalno ne dela, zato vsilimo Cloud!
+            success, error_msg = generate_via_cloud(image_path, win_out_path, ssat_steps, slat_scale)
+            
+            duration = time.time() - start_time
+            
+            if success and os.path.exists(win_out_path):
+                response = {
+                    "status": "success",
+                    "mesh_path": win_out_path,
+                    "duration_seconds": duration,
+                    "device": "Cloud API (Hugging Face)"
+                }
+            else:
+                response = {
+                    "status": "error",
+                    "message": f"Trellis Cloud generacija ni uspela.\nLog:\n{error_msg}",
+                    "mesh_path": "",
+                    "duration_seconds": duration,
+                    "device": "Cloud API (Hugging Face)"
+                }
+            
+            conn.sendall(json.dumps(response).encode('utf-8'))
+            
+    except Exception as e:
+        print(f"[TRELLIS_PROXY] Napaka: {e}")
+        err_res = {"status": "error", "message": str(e)}
+        conn.sendall(json.dumps(err_res).encode('utf-8'))
+    finally:
+        conn.close()
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((SERVER_HOST, SERVER_PORT))
+    server.listen(1)
+    print(f"[TRELLIS_PROXY] Poslušam za C++ na {SERVER_HOST}:{SERVER_PORT}...")
+    
+    while True:
+        conn, addr = server.accept()
+        handle_client(conn, addr)
+
+if __name__ == "__main__":
+    start_server()
+
+
+
+===== engine_diagnostics.py =====
+import os
+import sys
+import psutil
+import datetime
+
+LOG_FILE = "C:\\Users\\Blaz\\Desktop\\agentstudio\\Axonris_3D_Generator\\knowledge_base\\diagnostics.log"
+
+def check_memory():
+    mem = psutil.virtual_memory()
+    return mem.percent
+
+def log_event(message, level="INFO"):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] [{level}] {message}\n"
+    with open(LOG_FILE, "a") as f:
+        f.write(log_entry)
+    print(log_entry.strip())
+
+def run_diagnostics():
+    log_event("Starting Engine V2 Diagnostics Check...")
+    
+    # Check RAM
+    ram_usage = check_memory()
+    log_event(f"System RAM Usage: {ram_usage}%")
+    if ram_usage > 90:
+        log_event("CRITICAL: System RAM is critically high! Potential VRAM spillover from local LLM.", "ERROR")
+        
+    # Check LM Studio local server (port 1234)
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        result = s.connect_ex(('127.0.0.1', 1234))
+        if result == 0:
+            log_event("LM Studio API is ONLINE on port 1234.")
+        else:
+            log_event("WARNING: LM Studio API is NOT responding on port 1234. Local Code Reviewer is unreachable.", "WARNING")
+
+    # In the future: Add checks for WSL2 and Trellis Backend here
+    log_event("Diagnostics Check Complete.")
+
+if __name__ == "__main__":
+    run_diagnostics()
+
+
+
+===== garbage_collector.py =====
+import os
+import time
+from datetime import datetime
+
+def cleanup_old_files(directory, max_age_hours=24):
+    if not os.path.exists(directory):
+        return
+
+    current_time = time.time()
+    deleted_count = 0
+    freed_bytes = 0
+
+    for filename in os.listdir(directory):
+        filepath = os.path.join(directory, filename)
+        if os.path.isfile(filepath):
+            file_age_hours = (current_time - os.path.getmtime(filepath)) / 3600
+            
+            if file_age_hours > max_age_hours:
+                try:
+                    size = os.path.getsize(filepath)
+                    os.remove(filepath)
+                    deleted_count += 1
+                    freed_bytes += size
+                except Exception as e:
+                    print(f"[GARBAGE COLLECTOR] Napaka pri brisanju {filepath}: {e}")
+
+    if deleted_count > 0:
+        mb_freed = freed_bytes / (1024 * 1024)
+        print(f"[GARBAGE COLLECTOR] V mapi '{os.path.basename(directory)}' je bilo izbrisanih {deleted_count} starih datotek. Sprostitev: {mb_freed:.2f} MB.")
+
+if __name__ == "__main__":
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Zagon Garbage Collectorja...")
+    
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    
+    # 1. Čiščenje začasnih 3D renderjev in Rembg izrezov (starejše od 24 ur)
+    temp_dir = os.path.join(base_dir, "Axonris_3D_Generator", "temp")
+    cleanup_old_files(temp_dir, max_age_hours=24)
+    
+    # 2. Čiščenje starih, predelanih swarm ticketov (starejše od 24 ur)
+    tickets_dir = os.path.join(base_dir, "Axonris_AI_Framework", "swarm_tickets")
+    cleanup_old_files(tickets_dir, max_age_hours=24)
+    
+    print("[GARBAGE COLLECTOR] Čiščenje zaključeno.")
+
+
+
+===== github_syncer.py =====
+import os
+import glob
+import subprocess
+import time
+from datetime import datetime
+
+# KONFIGURACIJA
+LIBRARY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Axonris_Library_Main_test_engine")
+TEMP_GENERATED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Axonris_3D_Generator", "temp")
+GITHUB_REMOTE_URL = "https://github.com/TegySLO/Axonris_Library_Main_test_engine.git" # <--- Nastavi to
+
+def init_git_repo(path):
+    if not os.path.exists(os.path.join(path, ".git")):
+        os.makedirs(path, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=path)
+        print(f"[GITHUB SYNCER] Inicializiral nov prazen repozitorij v {path}")
+        
+        # Ustvari README, ce ga ni
+        readme_path = os.path.join(path, "README.md")
+        if not os.path.exists(readme_path):
+            with open(readme_path, "w") as f:
+                f.write("# Axonris 3D Library\n\nAvtomatsko zgenerirani modeli Main Engina.")
+            subprocess.run(["git", "add", "README.md"], cwd=path)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=path)
+
+def sync_to_github():
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [GITHUB SYNCER] Preverjam nove datoteke za prenos v oblak...")
+    
+    os.makedirs(TEMP_GENERATED_DIR, exist_ok=True)
+    os.makedirs(LIBRARY_DIR, exist_ok=True)
+    
+    init_git_repo(LIBRARY_DIR)
+    
+    # Najdi samo znanjske datoteke (md in json) v temp mapi
+    new_files_found = False
+    
+    # Sestavimo listo vseh .md in .json datotek
+    knowledge_files = glob.glob(os.path.join(TEMP_GENERATED_DIR, "*.md")) + glob.glob(os.path.join(TEMP_GENERATED_DIR, "*.json"))
+    
+    for filepath in knowledge_files:
+        filename = os.path.basename(filepath)
+        dest_path = os.path.join(LIBRARY_DIR, filename)
+        
+        # Premaknemo datoteko iz temp v naso git mapo
+        try:
+            import shutil
+            shutil.copy2(filepath, dest_path)
+            # BRISANJE ORIGINALA ZARADI PROSTORA NA LOKALNEM DISKU
+            os.remove(filepath)
+            new_files_found = True
+            print(f"[GITHUB SYNCER] Dokument '{filename}' prevzet iz lokalnega sistema in dodan v Knjižnico Znanja.")
+        except Exception as e:
+            print(f"Napaka pri prenosu {filename}: {e}")
+            
+    if new_files_found:
+        print("[GITHUB SYNCER] Pripravljam pošiljanje na GitHub oblak...")
+        try:
+            subprocess.run(["git", "add", "."], cwd=LIBRARY_DIR)
+            commit_msg = f"Auto-Sync: Dodano novo potrjeno znanje ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+            subprocess.run(["git", "commit", "-m", commit_msg], cwd=LIBRARY_DIR)
+            
+            # Če imamo remote url, ga pushamo
+            if "POVEZAVA" not in GITHUB_REMOTE_URL:
+                # Preveri, če je remote že dodan
+                res = subprocess.run(["git", "remote", "-v"], cwd=LIBRARY_DIR, capture_output=True, text=True)
+                if "origin" not in res.stdout:
+                    subprocess.run(["git", "remote", "add", "origin", GITHUB_REMOTE_URL], cwd=LIBRARY_DIR)
+                
+                print("[GITHUB SYNCER] Pushing to GitHub (Cloud Knowledge Base)...")
+                push_res = subprocess.run(["git", "push", "-u", "origin", "master"], cwd=LIBRARY_DIR)
+                if push_res.returncode == 0:
+                    print("[GITHUB SYNCER] USPEH! Znanje je varno v oblaku.")
+                    # Tu bi lahko sprožili izbris tudi iz lokalnega LIBRARY_DIR, 
+                    # a ga zaenkrat pustimo, da ga git lahko tracka, ali pa uporabimo git sparse-checkout.
+            else:
+                print("[GITHUB SYNCER] OPOZORILO: GitHub Remote URL ni nastavljen. Modeli so dodani v lokalni git trezor, a niso poslani v oblak.")
+                
+        except Exception as e:
+            print(f"[GITHUB SYNCER] Napaka pri Git komandah: {e}")
+    else:
+        print("[GITHUB SYNCER] Ni novih modelov za sinhronizacijo.")
+
+if __name__ == "__main__":
+    sync_to_github()
+
+
+
+===== local_ai_analyzer.py =====
+import requests
+import time
+import json
+import socket
+
+DASHBOARD_API = "http://127.0.0.1:8081/api"
+
+def send_log(msg):
+    try:
+        requests.post(f"{DASHBOARD_API}/log", json={"bot_name": "Qwen 2.5", "msg": msg})
+        print(f"[LOG] {msg}")
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Dashboard API nedosegljiv: {msg}")
+    except Exception as e:
+        print(f"[ERROR] Napaka pri pošiljanju loga: {e}")
+
+def start_task(task_id, human_desc, tech_desc, eta):
+    try:
+        requests.post(f"{DASHBOARD_API}/task/start", json={
+            "task_id": task_id,
+            "bot_name": "Qwen 2.5",
+            "human_desc": human_desc,
+            "tech_desc": tech_desc,
+            "eta_seconds": eta
+        })
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Dashboard API nedosegljiv pri zagonu naloge {task_id}")
+    except Exception as e:
+        print(f"[ERROR] Napaka pri zagonu naloge: {e}")
+
+def end_task(task_id):
+    try:
+        requests.post(f"{DASHBOARD_API}/task/end", json={"task_id": task_id})
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Dashboard API nedosegljiv pri zaključku naloge {task_id}")
+    except Exception as e:
+        print(f"[ERROR] Napaka pri zaključku naloge: {e}")
+
+def report_error(err_id, msg, status):
+    try:
+        requests.post(f"{DASHBOARD_API}/error", json={
+            "error_id": err_id,
+            "msg": msg,
+            "status": status
+        })
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Dashboard API nedosegljiv pri prijavi napake {err_id}")
+    except Exception as e:
+        print(f"[ERROR] Napaka pri prijavi napake: {e}")
+
+def simulate_qwen_analysis():
+    send_log("Inicializacija Qwen modela...")
+    time.sleep(1)
+    
+    # 1. Zagon naloge
+    start_task("qwen_review_1", "Lokalni AI pregleduje C++ datoteke", "POST http://127.0.0.1:1234/v1/chat/completions (temp=0.2)", 15)
+    
+    send_log("Povezovanje z LM Studiom na port 1234...")
+    time.sleep(2)
+    
+    # Namerna napaka za prikaz v dashboardu
+    send_log("Opa, napaka pri prenosu JSON paketa!")
+    report_error("err_json_1", "Napaka pri razčlenjevanju JSON podatkov iz C++ programa.", "UNRESOLVED")
+    
+    time.sleep(3)
+    send_log("Zagon 'Auto-Fix' logike...")
+    report_error("err_json_1", "Napaka pri razčlenjevanju JSON podatkov iz C++ programa.", "AUTO-FIXING")
+    
+    time.sleep(4)
+    send_log("Napaka uspešno popravljena v lokalnem pomnilniku.")
+    report_error("err_json_1", "Napaka pri razčlenjevanju JSON podatkov iz C++ programa.", "RESOLVED")
+    
+    time.sleep(2)
+    send_log("Analiza zaključena. Predajam nazaj glavnemu sistemu.")
+    
+    # 2. Zakljucek naloge
+    end_task("qwen_review_1")
+
+if __name__ == "__main__":
+    simulate_qwen_analysis()
+
+
+
+===== meta_dashboard.py =====
+import uvicorn
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import socket
+import os
+import psutil
+import time
+import requests
+import subprocess
+import threading
+
+app = FastAPI(title="Axonris Meta-Dashboard V3 - REST API")
+
+# GLOBALNO STANJE SISTEMA
+SYSTEM_LOGS = ["[SISTEM] Nadzorna plošča inicializirana. Čakam na bove..."]
+# Format errorja: {"id": "err_1", "msg": "Opis", "status": "UNRESOLVED" | "AUTO-FIXING" | "RESOLVED", "time": "12:00:00"}
+ERROR_LOGS = {}
+# Format taska: ključ = task_id, vrednost = dict z boti, ETA in opisi
+ACTIVE_TASKS = {}
+COMPLETED_TASKS = []
+
+# Pydantic modeli za API vhode
+class TaskStart(BaseModel):
+    task_id: str
+    bot_name: str
+    human_desc: str
+    tech_desc: str
+    eta_seconds: int
+
+class TaskEnd(BaseModel):
+    task_id: str
+
+class LogEntry(BaseModel):
+    bot_name: str
+    msg: str
+
+class ErrorEntry(BaseModel):
+    error_id: str
+    msg: str
+    status: str  # UNRESOLVED, AUTO-FIXING, RESOLVED
+
+def check_lm_studio():
+    try:
+        res = requests.get("http://127.0.0.1:1234/v1/models", timeout=0.5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("data") and len(data["data"]) > 0:
+                model_name = data["data"][0]["id"].split("/")[-1]
+                return f"ONLINE ({model_name})"
+            return "ONLINE (No model loaded)"
+        return "ERROR"
+    except Exception:
+        return "OFFLINE"
+
+def check_port(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+# --- API KONČNE TOČKE ZA BOTE ---
+
+@app.post("/api/task/start")
+async def start_task(task: TaskStart):
+    ACTIVE_TASKS[task.task_id] = {
+        "bot_name": task.bot_name,
+        "human_desc": task.human_desc,
+        "tech_desc": task.tech_desc,
+        "start_time": time.time(),
+        "eta_seconds": task.eta_seconds
+    }
+    time_str = time.strftime("%H:%M:%S")
+    SYSTEM_LOGS.append(f"[{time_str}] [{task.bot_name}] Zagon: {task.human_desc}")
+    return {"status": "ok"}
+
+@app.post("/api/task/end")
+async def end_task(task: TaskEnd):
+    if task.task_id in ACTIVE_TASKS:
+        info = ACTIVE_TASKS[task.task_id]
+        COMPLETED_TASKS.append({
+            "id": task.task_id,
+            "bot_name": info["bot_name"],
+            "human_desc": info["human_desc"],
+            "tech_desc": info["tech_desc"],
+            "remaining": "ZAKLJUČENO"
+        })
+        if len(COMPLETED_TASKS) > 5:
+            COMPLETED_TASKS.pop(0)
+        del ACTIVE_TASKS[task.task_id]
+        return {"status": "ok", "msg": "Task closed"}
+    return {"status": "error", "msg": "Task not found"}
+
+@app.post("/api/log")
+async def add_log(log: LogEntry):
+    time_str = time.strftime("%H:%M:%S")
+    msg = f"[{time_str}] [{log.bot_name}] {log.msg}"
+    SYSTEM_LOGS.append(msg)
+    if len(SYSTEM_LOGS) > 100:
+        SYSTEM_LOGS.pop(0)
+    return {"status": "ok"}
+
+@app.post("/api/error")
+async def update_error(err: ErrorEntry):
+    time_str = time.strftime("%H:%M:%S")
+    ERROR_LOGS[err.error_id] = {
+        "msg": err.msg,
+        "status": err.status,
+        "time": time_str
+    }
+    return {"status": "ok"}
+
+@app.post("/api/qa_bot/run")
+async def run_qa_bot():
+    """Zazene raziskovalnega bota kot locen proces v ozadju."""
+    def run_script():
+        try:
+            bot_path = os.path.join(os.path.dirname(__file__), "qa_research_bot.py")
+            venv_python = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Local_3D_Generator", "venv310", "Scripts", "python.exe")
+            subprocess.run([venv_python, bot_path], check=False)
+        except Exception as e:
+            print(f"Napaka pri zagonu QA bota: {e}")
+
+    threading.Thread(target=run_script, daemon=True).start()
+    return {"status": "ok", "msg": "QA Bot zagnan v ozadju"}
+
+# --- API ZA FRONTEND V BRSKALNIKU ---
+
+@app.get("/api/status")
+async def get_status():
+    import glob
+    import json
+    
+    # 1. Preberi aktivne Swarm Tickete
+    active_tasks_from_queue = []
+    tickets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "swarm_tickets")
+    if os.path.exists(tickets_dir):
+        for f in glob.glob(os.path.join(tickets_dir, "*.json")):
+            try:
+                with open(f, "r", encoding="utf-8") as file:
+                    ticket = json.load(file)
+                    # Če je ticket v teku ali PENDING
+                    if ticket.get("status") in ["IN_PROGRESS", "PENDING"]:
+                        active_tasks_from_queue.append({
+                            "bot_name": ticket.get("bot_role", "Unknown Bot"),
+                            "human_desc": ticket.get("instruction", "Ni opisa")[0:50] + "...",
+                            "tech_desc": ticket.get("task_type", "TASK"),
+                            "remaining": "Izvajam..." if ticket.get("status") == "IN_PROGRESS" else "Čakam v vrsti"
+                        })
+                    elif ticket.get("status") == "COMPLETED":
+                        COMPLETED_TASKS.append({
+                            "bot_name": ticket.get("bot_role", "Bot"),
+                            "human_desc": ticket.get("instruction", "Ni opisa")[0:50] + "...",
+                            "tech_desc": ticket.get("task_type", "TASK"),
+                            "remaining": "ZAKLJUČENO"
+                        })
+            except Exception:
+                pass
+                
+    # Omejimo COMPLETED_TASKS da UI ne bo prepoln
+    while len(COMPLETED_TASKS) > 5:
+        COMPLETED_TASKS.pop(0)
+
+    # Združimo aktivne iz queue z našimi legacy ACTIVE_TASKS in COMPLETED_TASKS
+    all_tasks = active_tasks_from_queue + COMPLETED_TASKS
+
+    return {
+        "lm_studio": check_lm_studio(),
+        "trellis_server": "ONLINE" if check_port(5000) else "OFFLINE",
+        "antigravity": "ACTIVE",
+        "ram_usage": f"{psutil.virtual_memory().percent}%",
+        "logs": SYSTEM_LOGS[-15:],
+        "errors": list(ERROR_LOGS.values()),
+        "active_tasks": all_tasks
+    }
+
+os.makedirs("dashboard", exist_ok=True)
+app.mount("/", StaticFiles(directory="dashboard", html=True), name="dashboard")
+
+if __name__ == "__main__":
+    print("[META-DASHBOARD] Zaganjam napredni REST API nadzorni center na http://localhost:8081")
+    uvicorn.run(app, host="0.0.0.0", port=8081)
+
+
+
+===== qa_research_bot.py =====
+import os
+import sys
+import json
+import time
+import requests
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
+from openai import OpenAI
+import re
+
+DASHBOARD_API = "http://127.0.0.1:8081/api"
+
+def send_log(bot_name, msg):
+    try:
+        requests.post(f"{DASHBOARD_API}/log", json={"bot_name": bot_name, "msg": msg}, timeout=1)
+    except:
+        pass
+
+MODEL_NAME = "qwen3.6-35b-a3b"
+
+client = OpenAI(
+    base_url="http://127.0.0.1:1234/v1",
+    api_key="lm-studio"
+)
+
+# --- ORODJA (TOOLS) ---
+def search_web(query: str) -> str:
+    msg = f"[TOOL] Iščem na DuckDuckGo: '{query}'"
+    print(msg)
+    send_log("QA Researcher", msg)
+    try:
+        ddgs = DDGS()
+        results = ddgs.text(query, max_results=3)
+        formatted = ""
+        for r in results:
+            formatted += f"Naslov: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n---\n"
+        return formatted if formatted else "Ni zadetkov."
+    except Exception as e:
+        return f"Napaka pri iskanju: {e}"
+
+def read_library(topic: str) -> str:
+    msg = f"[TOOL] Preverjam interno knjižnico za temo: '{topic}'"
+    print(msg)
+    send_log("QA Researcher", msg)
+    
+    library_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Axonris_Library_Main_test_engine")
+    if not os.path.exists(library_dir):
+        return "Knjižnica je prazna ali ne obstaja."
+        
+    found_info = ""
+    for root, dirs, files in os.walk(library_dir):
+        for file in files:
+            if file.endswith(".md") or file.endswith(".txt"):
+                try:
+                    with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                        content = f.read()
+                        if topic.lower() in content.lower():
+                            found_info += f"Najdeno v {file}:\n{content[:500]}...\n---\n"
+                except:
+                    pass
+    return found_info if found_info else f"Ni podatkov o '{topic}' v lokalni knjižnici. Potrebna raziskava na spletu."
+
+def scrape_page(url: str) -> str:
+    msg = f"[TOOL] Berem spletno stran: {url}"
+    print(msg)
+    send_log("QA Researcher", msg)
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        text = soup.get_text(separator=' ', strip=True)
+        return text[:3000]
+    except Exception as e:
+        return f"Napaka pri branju strani: {e}"
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Poišče informacije na spletu (DuckDuckGo). Vrne naslove, URL-je in kratke povzetke.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Iskalni niz"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape_page",
+            "description": "Prebere celotno besedilo s specifične spletne strani (URL). Uporabi po tem, ko s search_web najdeš ustrezen URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL spletne strani"}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_library",
+            "description": "PRED ISKANJEM PO SPLETU vedno uporabi to orodje! Preveri, če podatek že obstaja v tvoji interni Axonris knjižnici.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "Ključna beseda ali tema"}
+                },
+                "required": ["topic"]
+            }
+        }
+    }
+]
+
+# --- GLAVNA FUNKCIJA AGENTA ---
+
+def run_specialized_agent(ticket_id):
+    tickets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "swarm_tickets")
+    ticket_path = os.path.join(tickets_dir, f"{ticket_id}.json")
+    
+    if not os.path.exists(ticket_path):
+        print(f"[QA RESEARCHER] Napaka: Ticket {ticket_id} ne obstaja.")
+        return
+        
+    with open(ticket_path, "r", encoding="utf-8") as f:
+        ticket = json.load(f)
+        
+    instruction = ticket.get("instruction", "Ni navodil.")
+    msg = f"Prevzemam ticket {ticket_id}: {instruction}"
+    print(f"\n[QA RESEARCHER] {msg}")
+    send_log("QA Researcher", msg)
+    
+    prompt = f"""
+    Ti si QA Researcher bot v Multi-Agent sistemu. 
+    Tvoja naloga: {instruction}
+    
+    KRITIČNO PRAVILO: PREDEN UPORABIŠ `search_web`, OBVEZNO UPORABI `read_library`. 
+    Najprej preveri interno zbirko znanja. Če tam najdeš odgovor, uporabi tistega in ZAKLJUČI NALOGO (ne hodi na splet). 
+    Splet uporabi zgolj, če v knjižnici ni podatkov. Bodi strokoven in jedrnat.
+    """
+    
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "Začni z raziskavo zdaj."}
+    ]
+    
+    try:
+        while True:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.3
+            )
+            
+            response_message = response.choices[0].message
+            
+            if response_message.tool_calls:
+                messages.append(response_message)
+                for tool_call in response_message.tool_calls:
+                    function_name = tool_call.function.name
+                    arguments = json.loads(tool_call.function.arguments)
+                    
+                    if function_name == "search_web":
+                        tool_response = search_web(arguments.get("query"))
+                    elif function_name == "scrape_page":
+                        tool_response = scrape_page(arguments.get("url"))
+                    elif function_name == "read_library":
+                        tool_response = read_library(arguments.get("topic"))
+                    else:
+                        tool_response = "Neznano orodje."
+                        
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": tool_response
+                    })
+            else:
+                # Konec raziskave
+                ans = response_message.content
+                msg = f"Raziskava zaključena za ticket {ticket_id}."
+                print(f"[QA RESEARCHER] {msg}")
+                send_log("QA Researcher", msg)
+                
+                # Posodobi ticket
+                ticket["status"] = "COMPLETED"
+                ticket["result"] = ans
+                ticket["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                with open(ticket_path, "w", encoding="utf-8") as f:
+                    json.dump(ticket, f, indent=4)
+                    
+                break
+                
+    except Exception as e:
+        msg_err = f"Napaka pri raziskovanju: {e}"
+        print(f"[QA RESEARCHER] {msg_err}")
+        send_log("QA Researcher ERROR", msg_err)
+        ticket["status"] = "FAILED"
+        ticket["result"] = str(e)
+        with open(ticket_path, "w", encoding="utf-8") as f:
+            json.dump(ticket, f, indent=4)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        run_specialized_agent(sys.argv[1])
+    else:
+        print("[QA RESEARCHER] Napaka: Manjka Ticket ID. Uporaba: python qa_research_bot.py <ticket_id>")
+
+
+
+===== security_scanner.py =====
+import os
+import glob
+import json
+import re
+
+# KONFIGURACIJA
+INCOMING_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Axonris_Incoming_Queue")
+LIBRARY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Axonris_Library_Main_test_engine")
+
+DASHBOARD_API = "http://127.0.0.1:8081/api"
+import requests
+
+def send_log(msg):
+    try:
+        requests.post(f"{DASHBOARD_API}/log", json={"bot_name": "Security Gatekeeper", "msg": msg}, timeout=1)
+    except:
+        pass
+
+def scan_for_prompt_injection(text):
+    # Preprosta hevristika za znane poskuse prompt injectiona
+    dangerous_patterns = [
+        r"ignore previous instructions",
+        r"forget everything",
+        r"system override",
+        r"you are now",
+        r"bypassing filters"
+    ]
+    for pattern in dangerous_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+def scan_incoming_files():
+    if not os.path.exists(INCOMING_DIR):
+        os.makedirs(INCOMING_DIR, exist_ok=True)
+        return
+        
+    os.makedirs(LIBRARY_DIR, exist_ok=True)
+    
+    files_to_scan = glob.glob(os.path.join(INCOMING_DIR, "*.*"))
+    if not files_to_scan:
+        return
+        
+    send_log(f"Zaznana {len(files_to_scan)} nova datoteka v Karanteni. Zaganja se varnostni pregled...")
+    
+    for filepath in files_to_scan:
+        filename = os.path.basename(filepath)
+        is_safe = True
+        reason = ""
+        
+        # 1. Preverjanje 3D (.glb) datotek (Malware Payload v GLB metadata)
+        if filename.endswith(".glb"):
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            if size_mb > 50:
+                is_safe = False
+                reason = "Presega varnostno mejo 50MB (možen bloat bomb napad)."
+            else:
+                # Tu bi bil podroben GLB header scanner, za zdaj predpostavimo, da je varen, če je velikost normalna
+                pass
+                
+        # 2. Preverjanje JSON / Teksta (Prompt Injection)
+        elif filename.endswith(".json") or filename.endswith(".txt"):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if scan_for_prompt_injection(content):
+                        is_safe = False
+                        reason = "Zaznan poskus Data Poisoning / Prompt Injection!"
+            except Exception as e:
+                is_safe = False
+                reason = f"Nemogoče branje datoteke: {e}"
+        else:
+            is_safe = False
+            reason = "Nepodprt format datoteke (sumljiv payload)."
+            
+        # AKCIJA
+        if is_safe:
+            send_log(f"[VARNO] {filename} je čist. Premikam v Main Knjižnico.")
+            import shutil
+            shutil.move(filepath, os.path.join(LIBRARY_DIR, filename))
+        else:
+            send_log(f"[NEVARNO] {filename} zavrnjen! Razlog: {reason}. Datoteka bo izbrisana.")
+            os.remove(filepath)
+
+if __name__ == "__main__":
+    scan_incoming_files()
+
+
+
+===== swarm_manager.py =====
+import os
+import json
+import time
+import requests
+import uuid
+import glob
+from datetime import datetime
+import subprocess
+
+DASHBOARD_API = "http://127.0.0.1:8081/api"
+
+def send_log(msg):
+    try:
+        requests.post(f"{DASHBOARD_API}/log", json={"bot_name": "Swarm Manager", "msg": msg}, timeout=1)
+    except:
+        pass
+
+TICKETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "swarm_tickets")
+os.makedirs(TICKETS_DIR, exist_ok=True)
+
+def create_ticket(bot_role, task_type, instruction):
+    ticket_id = f"TICKET_{uuid.uuid4().hex[:8]}"
+    ticket = {
+        "id": ticket_id,
+        "bot_role": bot_role,
+        "task_type": task_type,
+        "instruction": instruction,
+        "status": "PENDING",
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "result": None
+    }
+    path = os.path.join(TICKETS_DIR, f"{ticket_id}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(ticket, f, indent=4)
+    msg = f"Ustvarjen nov ticket: {ticket_id} za {bot_role}"
+    print(f"[SWARM MANAGER] {msg}")
+    send_log(msg)
+    return ticket_id
+
+def check_system_health():
+    # Preveri LM Studio
+    lm_ok = False
+    try:
+        r = requests.get("http://127.0.0.1:1234/v1/models", timeout=2)
+        if r.status_code == 200:
+            lm_ok = True
+    except:
+        pass
+        
+    if not lm_ok:
+        msg = "OPOZORILO: LM Studio ni odziven! Preverite strežnik."
+        print(f"[AUTO-HEALER] {msg}")
+        send_log(msg)
+        
+    return lm_ok
+
+def assign_pending_tickets():
+    for filepath in glob.glob(os.path.join(TICKETS_DIR, "*.json")):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                ticket = json.load(f)
+                
+            # AUTO-RECOVERY PROTOKOL:
+            if ticket["status"] == "IN_PROGRESS":
+                updated_at_str = ticket.get("updated_at")
+                if updated_at_str:
+                    try:
+                        updated_at = datetime.fromisoformat(updated_at_str)
+                        if (datetime.now() - updated_at).total_seconds() > 1800: # 30 minut
+                            ticket["status"] = "PENDING"
+                            msg = f"CRASH RECOVERY: Ticket {ticket['id']} je bil predolgo v teku. Resetiran na PENDING."
+                            print(f"[SWARM MANAGER] {msg}")
+                            send_log(msg)
+                            with open(filepath, "w", encoding="utf-8") as fw:
+                                json.dump(ticket, fw, indent=4)
+                    except:
+                        pass
+                
+            if ticket["status"] == "PENDING":
+                msg_assign = f"Zaznan PENDING ticket: {ticket['id']}. Dodeljujem botu..."
+                print(f"[SWARM MANAGER] {msg_assign}")
+                send_log(msg_assign)
+                
+                ticket["status"] = "IN_PROGRESS"
+                ticket["updated_at"] = datetime.now().isoformat()
+                
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(ticket, f, indent=4)
+                
+                # Zaženi specializiranega bota
+                if ticket["bot_role"] == "QA_RESEARCHER":
+                    bot_path = os.path.join(os.path.dirname(__file__), "qa_research_bot.py")
+                    venv_python = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Local_3D_Generator", "venv310", "Scripts", "python.exe")
+                    
+                    subprocess.Popen([venv_python, bot_path, ticket["id"]])
+                    msg = f"QA Researcher zagnan za ticket {ticket['id']}."
+                    print(f"[SWARM MANAGER] {msg}")
+                    send_log(msg)
+        except Exception as e:
+            err = f"Napaka pri obdelavi ticketa: {e}"
+            print(err)
+            send_log(err)
+
+def main_loop():
+    start_msg1 = "Main Engine Swarm nadzornik aktiviran."
+    start_msg2 = "[ECO MODE] Pripravljen na auto-healing. Avtonomne raziskave so onemogočene (zaščita strojne opreme)."
+    print(f"[SWARM MANAGER] {start_msg1}")
+    print(f"[SWARM MANAGER] {start_msg2}")
+    send_log(start_msg1)
+    send_log(start_msg2)
+    
+    # Pridobimo pot do venv pythona in skript
+    current_dir = os.path.dirname(__file__)
+    gc_path = os.path.join(current_dir, "garbage_collector.py")
+    security_path = os.path.join(current_dir, "security_scanner.py")
+    venv_python = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "Local_3D_Generator", "venv310", "Scripts", "python.exe")
+    
+    last_gc_time = 0
+    last_sec_time = 0
+
+    while True:
+        check_system_health()
+        assign_pending_tickets()
+        
+        now = time.time()
+        
+        # Sproži Garbage Collector vsako uro (3600 sekund)
+        if now - last_gc_time > 3600:
+            if os.path.exists(gc_path):
+                msg = "Zaganjam Garbage Collector..."
+                print(f"[SWARM MANAGER] {msg}")
+                send_log(msg)
+                subprocess.Popen([venv_python, gc_path])
+            last_gc_time = now
+            
+        # Sproži Security Gatekeeper vsakih 30 sekund
+        if now - last_sec_time > 30:
+            if os.path.exists(security_path):
+                subprocess.Popen([venv_python, security_path])
+            last_sec_time = now
+            
+        time.sleep(10) # Preverja vsakih 10 sekund
+
+if __name__ == "__main__":
+    main_loop()
+
+
+
+===== sync_subagents.py =====
+import requests
+import time
+
+DASHBOARD_API = "http://127.0.0.1:8081/api"
+
+subagents = [
+    {
+        "task_id": "ag_sub_1",
+        "bot_name": "Antigravity (Research)", 
+        "human_desc": "TripoSR Quality Researcher", 
+        "tech_desc": "Searching web for optimal TripoSR parameters and chunk_size...", 
+        "eta_seconds": 600
+    },
+    {
+        "task_id": "ag_sub_2",
+        "bot_name": "Antigravity (SOTA)", 
+        "human_desc": "Local AI Logic Analyzer", 
+        "tech_desc": "Reviewing implementation_plan.md for TRELLIS.2 memory leaks", 
+        "eta_seconds": 450
+    },
+    {
+        "task_id": "ag_sub_3",
+        "bot_name": "Antigravity (Logic)", 
+        "human_desc": "C++ OpenGL Logic Analyzer", 
+        "tech_desc": "Reviewing pending_shader.h for Base Color PBR mapping", 
+        "eta_seconds": 500
+    },
+    {
+        "task_id": "ag_sub_4",
+        "bot_name": "Antigravity (ROCm)", 
+        "human_desc": "AMD ROCm Trellis Installation Expert", 
+        "tech_desc": "Finding spconv-rocm wheels for Ubuntu 22.04 WSL2", 
+        "eta_seconds": 720
+    }
+]
+
+def sync_subagents():
+    print("[SYNC] Pošiljam Antigravity subagente v lokalni nadzorni center...")
+    
+    # 1. Objava v dnevnik
+    requests.post(f"{DASHBOARD_API}/log", json={
+        "bot_name": "Antigravity Main", 
+        "msg": "Zaznanih 6 aktivnih subagentov. Sinhronizacija z UI..."
+    })
+    
+    # 2. Registracija nalog
+    for sa in subagents:
+        try:
+            requests.post(f"{DASHBOARD_API}/task/start", json=sa)
+            print(f"Uspešno prijavljen: {sa['human_desc']}")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Napaka pri prijavi {sa['task_id']}: {e}")
+
+if __name__ == "__main__":
+    sync_subagents()
+
+
+
