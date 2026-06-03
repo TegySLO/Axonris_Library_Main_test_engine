@@ -151,7 +151,16 @@ def run_specialized_agent(ticket_id):
     ]
     
     try:
-        while True:
+        max_iterations = 10
+        iteration = 0
+        while iteration < max_iterations:
+            # CONTEXT LIMIT PROTECTOR
+            # Če je sporočil več kot 15 ali je skupna dolžina besedila prevelika,
+            # pobrišemo najstarejša tool_call sporočila (zaščita RAM in Tokenov).
+            if len(messages) > 15:
+                # Ohranimo system prompt in prvo user sporočilo (prvi 2), nato zadnjih 10.
+                messages = messages[:2] + messages[-10:]
+                
             response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
@@ -183,6 +192,7 @@ def run_specialized_agent(ticket_id):
                         "name": function_name,
                         "content": tool_response
                     })
+                iteration += 1
             else:
                 # Konec raziskave
                 ans = response_message.content

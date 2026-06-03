@@ -19,6 +19,7 @@ ERROR_LOGS = {}
 # Format taska: ključ = task_id, vrednost = dict z boti, ETA in opisi
 ACTIVE_TASKS = {}
 COMPLETED_TASKS = []
+SEEN_COMPLETED_IDS = set()
 
 # Pydantic modeli za API vhode
 class TaskStart(BaseModel):
@@ -147,12 +148,15 @@ async def get_status():
                             "remaining": "Izvajam..." if ticket.get("status") == "IN_PROGRESS" else "Čakam v vrsti"
                         })
                     elif ticket.get("status") == "COMPLETED":
-                        COMPLETED_TASKS.append({
-                            "bot_name": ticket.get("bot_role", "Bot"),
-                            "human_desc": ticket.get("instruction", "Ni opisa")[0:50] + "...",
-                            "tech_desc": ticket.get("task_type", "TASK"),
-                            "remaining": "ZAKLJUČENO"
-                        })
+                        tid = ticket.get("id", os.path.basename(f))
+                        if tid not in SEEN_COMPLETED_IDS:
+                            SEEN_COMPLETED_IDS.add(tid)
+                            COMPLETED_TASKS.append({
+                                "bot_name": ticket.get("bot_role", "Bot"),
+                                "human_desc": ticket.get("instruction", "Ni opisa")[0:50] + "...",
+                                "tech_desc": ticket.get("task_type", "TASK"),
+                                "remaining": "ZAKLJUČENO"
+                            })
             except Exception:
                 pass
                 
@@ -173,8 +177,10 @@ async def get_status():
         "active_tasks": all_tasks
     }
 
-os.makedirs("dashboard", exist_ok=True)
-app.mount("/", StaticFiles(directory="dashboard", html=True), name="dashboard")
+import os
+dashboard_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dashboard")
+os.makedirs(dashboard_dir, exist_ok=True)
+app.mount("/", StaticFiles(directory=dashboard_dir, html=True), name="dashboard")
 
 if __name__ == "__main__":
     print("[META-DASHBOARD] Zaganjam napredni REST API nadzorni center na http://localhost:8081")

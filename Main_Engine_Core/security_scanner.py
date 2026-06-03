@@ -5,7 +5,7 @@ import re
 
 # KONFIGURACIJA
 INCOMING_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Axonris_Incoming_Queue")
-LIBRARY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Axonris_Library_Main_test_engine")
+LIBRARY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Axonris_Library_Main_test_engine")
 
 DASHBOARD_API = "http://127.0.0.1:8081/api"
 import requests

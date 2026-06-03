@@ -28,6 +28,7 @@ def create_ticket(bot_role, task_type, instruction):
         "status": "PENDING",
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
+        "priority": 2,  # Default na medium (1=High, 2=Medium, 3=Low)
         "result": None
     }
     path = os.path.join(TICKETS_DIR, f"{ticket_id}.json")
@@ -56,13 +57,23 @@ def check_system_health():
     return lm_ok
 
 def assign_pending_tickets():
+    # Omejitev: Nikoli ne zaženi več kot 2 bota hkrati (Eco Mode zaščita)
+    import psutil
+    active_bots = sum(1 for p in psutil.process_iter(['cmdline']) 
+                      if p.info['cmdline'] and any('qa_research_bot' in str(c) for c in p.info['cmdline']))
+    
+    if active_bots >= 2:
+        return  # Preveč aktivnih botov, čakamo
+    
+    pending_tickets = []
+    
     for filepath in glob.glob(os.path.join(TICKETS_DIR, "*.json")):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 ticket = json.load(f)
                 
             # AUTO-RECOVERY PROTOKOL:
-            if ticket["status"] == "IN_PROGRESS":
+            if ticket.get("status") == "IN_PROGRESS":
                 updated_at_str = ticket.get("updated_at")
                 if updated_at_str:
                     try:
@@ -77,30 +88,39 @@ def assign_pending_tickets():
                     except:
                         pass
                 
-            if ticket["status"] == "PENDING":
-                msg_assign = f"Zaznan PENDING ticket: {ticket['id']}. Dodeljujem botu..."
-                print(f"[SWARM MANAGER] {msg_assign}")
-                send_log(msg_assign)
+            if ticket.get("status") == "PENDING":
+                pending_tickets.append((filepath, ticket))
                 
-                ticket["status"] = "IN_PROGRESS"
-                ticket["updated_at"] = datetime.now().isoformat()
-                
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(ticket, f, indent=4)
-                
-                # Zaženi specializiranega bota
-                if ticket["bot_role"] == "QA_RESEARCHER":
-                    bot_path = os.path.join(os.path.dirname(__file__), "qa_research_bot.py")
-                    venv_python = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Local_3D_Generator", "venv310", "Scripts", "python.exe")
-                    
-                    subprocess.Popen([venv_python, bot_path, ticket["id"]])
-                    msg = f"QA Researcher zagnan za ticket {ticket['id']}."
-                    print(f"[SWARM MANAGER] {msg}")
-                    send_log(msg)
         except Exception as e:
-            err = f"Napaka pri obdelavi ticketa: {e}"
-            print(err)
-            send_log(err)
+            pass
+            
+    # SORTIRANJE (Priority Queue)
+    # Najprej sortiramo po 'priority' (1 je najvišja), nato po 'created_at' (najstarejši prvi)
+    pending_tickets.sort(key=lambda x: (x[1].get("priority", 2), x[1].get("created_at", "")))
+    
+    # Procesiramo le toliko ticketov, kolikor imamo prostih "Eco Mode" slotov
+    slots_available = 2 - active_bots
+    
+    for filepath, ticket in pending_tickets[:slots_available]:
+        msg_assign = f"Zaznan PENDING ticket (Prioriteta {ticket.get('priority', 2)}): {ticket['id']}. Dodeljujem botu..."
+        print(f"[SWARM MANAGER] {msg_assign}")
+        send_log(msg_assign)
+        
+        ticket["status"] = "IN_PROGRESS"
+        ticket["updated_at"] = datetime.now().isoformat()
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(ticket, f, indent=4)
+        
+        # Zaženi specializiranega bota
+        if ticket.get("bot_role") == "QA_RESEARCHER":
+            bot_path = os.path.join(os.path.dirname(__file__), "qa_research_bot.py")
+            venv_python = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Local_3D_Generator", "venv310", "Scripts", "python.exe")
+            
+            subprocess.Popen([venv_python, bot_path, ticket["id"]])
+            msg = f"QA Researcher zagnan za ticket {ticket['id']}."
+            print(f"[SWARM MANAGER] {msg}")
+            send_log(msg)
 
 def main_loop():
     start_msg1 = "Main Engine Swarm nadzornik aktiviran."
